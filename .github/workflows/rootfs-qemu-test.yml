@@ -46,9 +46,20 @@ jobs:
           set -e
           echo "=== searching for kernel Mach-O ==="
           find out -type f | head -50
-          KERNEL=$(find out -type f -name 'kernel.development*' | head -1)
+          echo "=== pick the real 64-bit Mach-O by magic (0xfeedfacf little-endian) ==="
+          KERNEL=""
+          for f in $(find out -type f); do
+            # 读文件头 4 字节，判断是否是 64 位小端 arm64 Mach-O (cf fa ed fe)
+            magic=$(python3 -c "import sys;d=open(sys.argv[1],'rb').read(4);print(d.hex())" "$f" 2>/dev/null)
+            if [ "$magic" = "cffaedfe" ]; then
+              echo "  FOUND Mach-O: $f (magic $magic)"
+              KERNEL="$f"
+              break
+            fi
+          done
           if [ -z "$KERNEL" ]; then
-            KERNEL=$(find out -type f -name 'kernel.*' | head -1)
+            echo "no Mach-O found by magic, falling back to name match"
+            KERNEL=$(find out -type f -name 'kernel.development*' | head -1)
           fi
           echo "KERNEL=$KERNEL"
           echo "KERNEL=$KERNEL" >> "$GITHUB_ENV"
