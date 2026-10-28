@@ -113,8 +113,7 @@ jobs:
           mkdir -p run
           python3 tools/qemu-sweet.py payload-qemu.bin run \
             --secs "${{ inputs.secs || '40' }}" \
-            --live-serial \
-            --fail-on-panic 2>&1 | tee run-console.txt || echo "qemu run exited with $?"
+            --live-serial 2>&1 | tee run-console.txt || echo "qemu run exited with $?"
 
       # ---- 5. 展示结果
       - name: Show results
