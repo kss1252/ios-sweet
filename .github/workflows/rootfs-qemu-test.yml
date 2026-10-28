@@ -105,13 +105,15 @@ jobs:
           set -e
           echo "=== install qemu ==="
           sudo apt-get install -y -q qemu-system-arm
+          echo "=== install llvm (needed for --kernel font extraction) ==="
+          sudo apt-get install -y -q llvm
           echo "=== check env ==="
           python3 tools/qemu-sweet.py --check-env || true
-          echo "=== run kernel with ramdisk ==="
+          echo "=== run kernel with ramdisk (use --live-serial, no --kernel to avoid llvm-nm hard dep) ==="
           mkdir -p run
           python3 tools/qemu-sweet.py payload-qemu.bin run \
             --secs "${{ inputs.secs || '40' }}" \
-            --kernel "$KERNEL" \
+            --live-serial \
             --fail-on-panic 2>&1 | tee run-console.txt || echo "qemu run exited with $?"
 
       # ---- 5. 展示结果
