@@ -1,0 +1,141 @@
+name: rootfs-qemu-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      secs:
+        description: "QEMU run duration in seconds"
+        default: "40"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/rootfs-qemu-test.yml"
+
+jobs:
+  test-rootfs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- 1. 拿内核：从本仓库已有的 xnu 构建产物（如果触发过 xnu workflow）
+      #      GitHub Actions 产物默认不能跨 workflow 直接引用，这里降级为：
+      #      尝试用 nightly.link 之类方式，或提示先跑 xnu 构建。
+      #      更稳的做法：直接下载作者公开仓库最近一次 xnu-kernel 产物。
+      - name: Fetch prebuilt kernel via nightly.link
+        run: |
+          set -e
+          # 作者公开仓库最近一次成功构建的 run id（xnu.yml）
+          # 这个 id 需要更新为最新可用值；先用仓库已知的一次成功 run。
+          RUN_ID="39158169212"
+          ARTIFACT="xnu-kernel"
+          URL="https://nightly.link/dipa-studio/ios-sweet/actions/runs/${RUN_ID}/${ARTIFACT}.zip"
+          echo "Downloading kernel artifact from $URL"
+          curl -sL --retry 5 --retry-delay 3 -o xnu-kernel.zip "$URL"
+          ls -l xnu-kernel.zip
+          python3 - <<'PY'
+          import zipfile
+          z = zipfile.ZipFile('xnu-kernel.zip')
+          z.extractall('out')
+          import os
+          print('extracted:', os.listdir('out'))
+          PY
+
+      - name: Locate kernel Mach-O
+        run: |
+          set -e
+          echo "=== searching for kernel Mach-O ==="
+          find out -type f | head -50
+          KERNEL=$(find out -type f -name 'kernel.development*' | head -1)
+          if [ -z "$KERNEL" ]; then
+            KERNEL=$(find out -type f -name 'kernel.*' | head -1)
+          fi
+          echo "KERNEL=$KERNEL"
+          echo "KERNEL=$KERNEL" >> "$GITHUB_ENV"
+          ls -l "$KERNEL"
+
+      # ---- 2. 生成最小 ramdisk（HFS+ 格式，塞一个假的 /sbin/launchd）
+      - name: Build minimal rootfs ramdisk
+        run: |
+          set -e
+          echo "=== install hfsprogs ==="
+          sudo apt-get update -q
+          sudo apt-get install -y -q hfsprogs qemu-utils
+          echo "=== create a small HFS+ image ==="
+          # 16 MiB HFS+ image, enough for a minimal root
+          dd if=/dev/zero of=rootfs.img bs=1M count=16
+          # hfsprogs mkfs.hfsplus 需要 block device；用 loop 或者直接 mkfs 到文件
+          # mkfs.hfsplus 支持文件镜像
+          mkfs.hfsplus -v rootfs rootfs.img
+          echo "=== mount it to add a fake launchd ==="
+          mkdir -p mnt
+          sudo mount -t hfsplus -o loop rootfs.img mnt || {
+            echo "loop mount failed, trying explicit loop device"
+            sudo losetup -f --show rootfs.img > loopdev.txt
+            LOOP=$(cat loopdev.txt)
+            sudo mount -t hfsplus "$LOOP" mnt
+          }
+          sudo mkdir -p mnt/sbin
+          # 放一个 shell 脚本假装是 launchd（真实 launchd 需要完整 dyld/userland，
+          # 这里只验证 bsd_init 能否 exec 它 / 走到启动用户态那一步）
+          printf '#!/bin/sh\necho "FAKE LAUNCHD STARTED"\nsleep 999999\n' | sudo tee mnt/sbin/launchd >/dev/null
+          sudo chmod +x mnt/sbin/launchd
+          sync
+          sudo umount mnt || true
+          echo "=== rootfs.img ready ==="
+          ls -l rootfs.img
+          echo "ROOTFS=rootfs.img" >> "$GITHUB_ENV"
+
+      # ---- 3. 生成 ADT + 打包 payload（带 --ramdisk）
+      - name: Build payload with ramdisk
+        run: |
+          set -e
+          echo "=== mkadt ==="
+          python3 tools/mkadt.py qemu.adt --qemu
+          ls -l qemu.adt
+          echo "=== mkpayload (WITH --ramdisk) ==="
+          python3 tools/mkpayload.py "$KERNEL" qemu.adt payload-qemu.bin \
+            --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam rd=md0" \
+            --ramdisk rootfs.img
+          ls -l payload-qemu.bin
+
+      # ---- 4. 装 QEMU 并跑内核
+      - name: Install QEMU and run kernel
+        run: |
+          set -e
+          echo "=== install qemu ==="
+          sudo apt-get install -y -q qemu-system-arm
+          echo "=== check env ==="
+          python3 tools/qemu-sweet.py --check-env || true
+          echo "=== run kernel with ramdisk ==="
+          mkdir -p run
+          python3 tools/qemu-sweet.py payload-qemu.bin run \
+            --secs "${{ inputs.secs || '40' }}" \
+            --kernel "$KERNEL" \
+            --fail-on-panic 2>&1 | tee run-console.txt || echo "qemu run exited with $?"
+
+      # ---- 5. 展示结果
+      - name: Show results
+        if: always()
+        run: |
+          set -e
+          echo "=== result.json ==="
+          cat run/result.json 2>/dev/null || echo "(no result.json)"
+          echo "=== fb.txt (decoded console) ==="
+          cat run/fb.txt 2>/dev/null | head -120 || echo "(no fb.txt)"
+          echo "=== search for launchd / bsd_init markers ==="
+          grep -iE "launchd|bsd_init|mountroot|root device|panic|machine_idle" run/qemu.log run/fb.txt run-console.txt 2>/dev/null | head -40 || echo "(no markers found)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qemu-rootfs-results
+          path: |
+            run/fb.png
+            run/fb.txt
+            run/qemu.log
+            run/result.json
+            run-console.txt
+            payload-qemu.bin
+            rootfs.img
+          if-no-files-found: warn
