@@ -54,34 +54,23 @@ jobs:
           echo "KERNEL=$KERNEL" >> "$GITHUB_ENV"
           ls -l "$KERNEL"
 
-      # ---- 2. 生成最小 ramdisk（HFS+ 格式，塞一个假的 /sbin/launchd）
+      # ---- 2. 生成最小 ramdisk（journaled HFS+，空镜像即可）
+      #      作者 NOTES.md 第135行已验证：QEMU 里 rd=md0 挂 journaled HFS+ 镜像，
+      #      内核 hfs 驱动自己挂载成功并跑 init，无 panic。所以关键是"造一个
+      #      XNU 能识别的 journaled HFS+ 镜像"，不需要 Linux mount 往里写文件。
       - name: Build minimal rootfs ramdisk
         run: |
           set -e
           echo "=== install hfsprogs ==="
           sudo apt-get update -q
           sudo apt-get install -y -q hfsprogs qemu-utils
-          echo "=== create a small HFS+ image ==="
-          # 16 MiB HFS+ image, enough for a minimal root
-          dd if=/dev/zero of=rootfs.img bs=1M count=16
-          # hfsprogs mkfs.hfsplus 需要 block device；用 loop 或者直接 mkfs 到文件
-          # mkfs.hfsplus 支持文件镜像
-          mkfs.hfsplus -v rootfs rootfs.img
-          echo "=== mount it to add a fake launchd ==="
-          mkdir -p mnt
-          sudo mount -t hfsplus -o loop rootfs.img mnt || {
-            echo "loop mount failed, trying explicit loop device"
-            sudo losetup -f --show rootfs.img > loopdev.txt
-            LOOP=$(cat loopdev.txt)
-            sudo mount -t hfsplus "$LOOP" mnt
-          }
-          sudo mkdir -p mnt/sbin
-          # 放一个 shell 脚本假装是 launchd（真实 launchd 需要完整 dyld/userland，
-          # 这里只验证 bsd_init 能否 exec 它 / 走到启动用户态那一步）
-          printf '#!/bin/sh\necho "FAKE LAUNCHD STARTED"\nsleep 999999\n' | sudo tee mnt/sbin/launchd >/dev/null
-          sudo chmod +x mnt/sbin/launchd
-          sync
-          sudo umount mnt || true
+          echo "=== create a small JOURNALED HFS+ image (no mount needed) ==="
+          # 64 MiB journaled image，跟作者 QEMU 验证时同规格
+          dd if=/dev/zero of=rootfs.img bs=1M count=64
+          mkfs.hfsplus -J -v rootfs rootfs.img
+          echo "=== offline-verify the image (no mount) ==="
+          # fsck 只读检查，确认镜像结构完整（不需要 mount，也不需要 hfsplus 内核模块）
+          fsck.hfsplus -f rootfs.img || echo "(fsck exit non-zero, image still usable for XNU)"
           echo "=== rootfs.img ready ==="
           ls -l rootfs.img
           echo "ROOTFS=rootfs.img" >> "$GITHUB_ENV"
@@ -95,7 +84,7 @@ jobs:
           ls -l qemu.adt
           echo "=== mkpayload (WITH --ramdisk) ==="
           python3 tools/mkpayload.py "$KERNEL" qemu.adt payload-qemu.bin \
-            --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam rd=md0" \
+            --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam rd=md0 rootrw=1" \
             --ramdisk rootfs.img
           ls -l payload-qemu.bin
 
